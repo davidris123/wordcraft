@@ -728,6 +728,10 @@ pub struct WordApp {
     /// the session's document, no document is open: the window shows no page and only the File
     /// tab, Help and settings work. See [`WordApp::has_document`].
     no_document: Option<u64>,
+    /// The document ([`Session::document_id`]) and file Recent last put first: a document joins
+    /// the list when it is opened or saved under a new name, not again after every command, so one
+    /// taken off the list (or a cleared list) stays that way while it is open.
+    recent_added: Option<(u64, std::path::PathBuf)>,
     /// Comment and reply text typed but not yet written to the document (#1348).
     pub(crate) comment_drafts: panes::CommentDrafts,
     /// The document the window's per-document state belongs to; when the session's active
@@ -877,6 +881,7 @@ impl WordApp {
             font_generation: wordcraft_fonts::FontDb::global().generation(),
             recovery_seen: false,
             no_document: None,
+            recent_added: None,
             comment_drafts: Default::default(),
             parked: Default::default(),
             windows: windows::Windows::new(shown_document),
@@ -973,6 +978,8 @@ impl WordApp {
         // Word opens on Home every launch, so the tab `ui.json` holds is not restored. Going File
         // and back to the editor within the run still returns to the tab that was showing.
         self.ui.tab = DEFAULT_TAB.into();
+        // The saved Recent list gets the open document, if any, after the next command.
+        self.recent_added = None;
         let recent_fonts = recent_fonts_from(self.ui.recent_fonts.iter().map(String::as_str));
         self.ui.recent_fonts = recent_fonts;
         // A `ui.json` from before the theme setting: its dark-mode switch picks Dark or Light.
@@ -1678,12 +1685,17 @@ impl WordApp {
         for req in std::mem::take(&mut self.session.ui_requests) {
             self.handle_request(&req);
         }
-        if let Some(p) = self.session.path.as_ref().map(|p| p.to_string_lossy().to_string())
-            && self.ui.recent.first() != Some(&p)
-        {
-            self.ui.recent.retain(|r| *r != p);
-            self.ui.recent.insert(0, p);
-            self.ui.recent.truncate(MAX_RECENT);
+        // A document joins Recent, first, when it is opened or saved under a new name; not again
+        // on every command, so one taken off the list (or a cleared list) stays so while it is open.
+        if let Some(path) = self.session.path.clone() {
+            let added = (self.session.document_id(), path);
+            if self.recent_added.as_ref() != Some(&added) {
+                let p = added.1.to_string_lossy().to_string();
+                self.ui.recent.retain(|r| *r != p);
+                self.ui.recent.insert(0, p);
+                self.ui.recent.truncate(MAX_RECENT);
+                self.recent_added = Some(added);
+            }
         }
         if !self.session.status.is_empty() {
             // Engine messages are English; the catalog translates the ones it knows.
@@ -2096,6 +2108,24 @@ impl WordApp {
                     Some(_) => return Some(Err("`value` must be true or false".into())),
                 }
                 json!({"startScreen": self.ui.start_screen})
+            }
+            // File › Home and Open › Recent: take `path` off the list, as its right-click Remove
+            // from list does, and the prompt for a document that isn't there any more. The file
+            // itself is left alone. `recent` is the list that remains.
+            "ui.recentRemove" => {
+                let Some(path) = s("path") else {
+                    return Some(Err("`path` must be the path of a recent document".into()));
+                };
+                let before = self.ui.recent.len();
+                self.ui.recent.retain(|r| r.as_str() != path);
+                let removed = self.ui.recent.len() < before;
+                json!({"removed": removed, "recent": self.ui.recent})
+            }
+            // File › Home and Open › Recent › Clear list…: empty the list (the dialog asks first;
+            // this doesn't). The files stay where they are. `cleared`: how many entries it had.
+            "ui.recentClear" => {
+                let cleared = std::mem::take(&mut self.ui.recent).len();
+                json!({"cleared": cleared})
             }
             // Shape Format › Text › Create Link: the next click on an empty text box links the
             // selected box to it (`shape.link` with that box as the target); Esc cancels.
@@ -3352,6 +3382,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.caretAnimation"
             | "ui.startScreen"
             | "ui.checkForUpdates"
+            | "ui.recentRemove"
+            | "ui.recentClear"
     ) || id.starts_with("help.")
 }
 
@@ -3946,6 +3978,44 @@ mod tests {
         let old: UiState = serde_json::from_str(r#"{"tab":"Insert"}"#).unwrap();
         assert!(old.caret_animation && old.tab == "Insert");
         assert_eq!(a.run("ui.caretAnimation", json!({"value": true})).unwrap()["caretAnimation"], true);
+    }
+
+    /// File › Home and Open › Recent: `ui.recentRemove` takes exactly one path off the list and
+    /// `ui.recentClear` empties it, with no document open too (the Start screen lists Recent);
+    /// junk is refused. The open document doesn't come back while it is edited, only when it is
+    /// opened again.
+    #[test]
+    fn recent_documents_can_be_removed_and_cleared() {
+        let dir = scratch("recent-clear");
+        let p = docx_on_disk(&dir, "Recent work").to_string_lossy().into_owned();
+        let other = dir.join("other.docx").to_string_lossy().into_owned();
+        let mut a = app();
+        a.run("file.open", json!({"path": p})).unwrap();
+        assert_eq!(a.ui.recent, [p.as_str()], "an opened document joins the list");
+        a.ui.recent.push(other.clone());
+        assert_eq!(a.run("ui.recentRemove", json!({"path": "elsewhere.docx"})).unwrap()["removed"], false);
+        assert_eq!(a.run("ui.recentRemove", json!({"path": p})).unwrap(), json!({"removed": true, "recent": [other]}));
+        a.run("text.insert", json!({"text": "More "})).unwrap();
+        assert_eq!(a.ui.recent, [other.as_str()], "the open document stays off the list while it is edited");
+        assert_eq!(a.run("ui.recentClear", json!({})).unwrap(), json!({"cleared": 1}));
+        a.run("text.insert", json!({"text": "And more "})).unwrap();
+        assert!(a.ui.recent.is_empty(), "a cleared list stays clear");
+        for junk in [json!({}), json!({"path": 7}), json!({"path": null}), json!({"path": ["a"]}), json!([])] {
+            assert!(a.run("ui.recentRemove", junk).is_err());
+        }
+        // Opened again, it is first on the list again.
+        a.session.dirty = false;
+        a.run("file.open", json!({"path": p})).unwrap();
+        assert_eq!(a.ui.recent, [p.as_str()]);
+
+        // The Start screen: no document is open, and the list still works.
+        let mut b = app();
+        b.ui.recent = vec![p.clone(), other.clone()];
+        assert!(b.start_screen() && !b.has_document());
+        assert_eq!(b.run("ui.recentRemove", json!({"path": other})).unwrap()["removed"], true);
+        assert_eq!(b.run("ui.recentClear", json!({})).unwrap(), json!({"cleared": 1}));
+        assert!(b.ui.recent.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1945: showing or hiding the Quick Access Toolbar is a UI command (no value toggles it),

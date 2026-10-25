@@ -402,6 +402,14 @@ pub enum Dialog {
         id: String,
         name: String,
     },
+    /// A Recent document whose file isn't at `path` any more (moved, renamed, deleted, or on a
+    /// drive that isn't connected): Remove from list takes it off (`ui.recentRemove`), Cancel
+    /// keeps it to try again later.
+    MissingRecent {
+        path: String,
+    },
+    /// File › Home and Open › Recent › Clear list…: asks before emptying the list (`ui.recentClear`).
+    ClearRecent,
     /// "Do you want to save changes?" before a user's New, Open, Close, Envelopes, Labels or
     /// Finish & Merge replaces the document (see [`WordApp::run`]); `then` runs once it is
     /// answered (`ui.saveChanges`), and only while the document it asked about
@@ -1155,6 +1163,8 @@ impl Dialog {
             Dialog::About { .. } => "about",
             Dialog::SaveChanges { .. } => "saveChanges",
             Dialog::DiscardRecovery { .. } => "discardRecovery",
+            Dialog::MissingRecent { .. } => "missingRecent",
+            Dialog::ClearRecent => "clearRecent",
             Dialog::RecipientList { .. } => "recipientList",
             Dialog::SelectTable { .. } => "selectTable",
             Dialog::InsertMergeField { .. } => "insertMergeField",
@@ -1402,6 +1412,7 @@ impl Dialog {
             "about" => Dialog::About { tab: 0 },
             "contributors" => Dialog::About { tab: 1 },
             "models" => Dialog::About { tab: 2 },
+            "clearRecent" => Dialog::ClearRecent,
             // The current list to edit, or a new one to type.
             "recipientList" | "newRecipientList" => {
                 let m = &app.session.merge;
@@ -1635,6 +1646,8 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         Dialog::About { .. } => "About WordCraft",
         Dialog::SaveChanges { .. } => "WordCraft",
         Dialog::DiscardRecovery { .. } => "Discard recovery copy",
+        Dialog::MissingRecent { .. } => "Document not found",
+        Dialog::ClearRecent => "Clear recent documents",
         Dialog::RecipientList { .. } => "Recipient List",
         Dialog::SelectTable { .. } => "Select Table",
         Dialog::InsertMergeField { .. } => "Insert Merge Field",
@@ -2939,6 +2952,29 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
                 return result.is_ok();
             }
             false
+        }
+        Dialog::MissingRecent { path } => {
+            let t = Tokens::get(ui.ctx());
+            let name = std::path::Path::new(path.as_str()).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().to_string());
+            ui.label(egui::RichText::new(crate::i18n::fmt(tl!("Can't find {name}"), &[("name", &name)])).font(semibold(15.0)));
+            ui.label(egui::RichText::new(path.as_str()).small().color(t.text_dim));
+            ui.add_space(4.0);
+            ui.label(tl!("It isn't at this location any more. Remove it from the Recent list?"));
+            ui.label(tl!("If it's on a drive or network share that isn't connected, cancel to keep it in the list."));
+            let (remove, keep) = buttons(ui, tl!("Remove from list"));
+            if remove && let Err(e) = app.run("ui.recentRemove", json!({"path": path.as_str()})) {
+                app.status(e);
+            }
+            remove || keep
+        }
+        Dialog::ClearRecent => {
+            ui.label(egui::RichText::new(tl!("Clear the Recent list?")).font(semibold(15.0)));
+            ui.label(tl!("Every document is taken off the list. The files themselves stay where they are."));
+            let (clear, cancel) = buttons(ui, tl!("Clear"));
+            if clear && let Err(e) = app.run("ui.recentClear", json!({})) {
+                app.status(e);
+            }
+            clear || cancel
         }
         Dialog::SaveChanges { name, message, .. } => {
             ui.label(egui::RichText::new(crate::i18n::fmt(tl!("Do you want to save changes to {name}?"), &[("name", name)])).font(semibold(15.0)));
