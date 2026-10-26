@@ -974,6 +974,57 @@ mod tests {
         assert_eq!(h.state().ui.recent, [two]);
     }
 
+    /// The Enter that opens a Recent prompt doesn't answer it: File draws before the dialogs, in
+    /// the same pass, and egui leaves the key in the input when it clicks the focused Clear list…
+    /// or recent document. In a prompt, Enter on the focused Cancel cancels; with neither button
+    /// focused, Enter gives the prompt's own answer.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_enter_that_opens_a_recent_prompt_does_not_answer_it() {
+        let dir = std::env::temp_dir().join("wordcraft-recent-enter");
+        let paths = ["One.docx", "Two.docx"].map(|f| dir.join(f).to_string_lossy().into_owned());
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
+        a.ui.recent = paths.to_vec();
+        a.run("ui.backstage", json!({"value": true, "page": "open"})).unwrap();
+        let mut h = a11y_harness(a);
+        let prompt = |h: &egui_kittest::Harness<'static, WordApp>| h.state().dialog.as_ref().map(|d| d.name());
+        let enter_on = |h: &mut egui_kittest::Harness<'static, WordApp>, label: &str| {
+            h.get_by_label(label).focus();
+            h.run_steps(2);
+            assert!(h.get_by_label(label).is_focused(), "{label} has focus");
+            h.key_press(egui::Key::Enter);
+            h.run_steps(4);
+        };
+
+        enter_on(&mut h, "Clear list…");
+        assert_eq!(prompt(&h), Some("clearRecent"), "Enter on Clear list… asks");
+        assert_eq!(h.state().ui.recent, paths, "the Enter that opened the prompt doesn't clear the list");
+        enter_on(&mut h, "Cancel");
+        assert_eq!(prompt(&h), None);
+        assert_eq!(h.state().ui.recent, paths, "Enter on Cancel keeps the list");
+
+        enter_on(&mut h, "One.docx");
+        assert_eq!(prompt(&h), Some("missingRecent"), "Enter on a recent document that isn't there asks");
+        assert_eq!(h.state().ui.recent, paths, "the Enter that opened the prompt doesn't take it off");
+        enter_on(&mut h, "Cancel");
+        assert_eq!(prompt(&h), None);
+        assert_eq!(h.state().ui.recent, paths, "Enter on Cancel keeps it");
+
+        // With neither button focused, Enter answers: Remove from list, then Clear.
+        h.get_by_label("One.docx").click();
+        h.run_steps(4);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(4);
+        assert_eq!(prompt(&h), None);
+        assert_eq!(h.state().ui.recent, [paths[1].as_str()], "Enter takes it off");
+        h.get_by_label("Clear list…").click();
+        h.run_steps(4);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(4);
+        assert_eq!(prompt(&h), None);
+        assert!(h.state().ui.recent.is_empty(), "Enter clears the list");
+    }
+
     /// #1873: the macOS back chevron sits beside the traffic lights windowed, at the plain
     /// control inset in full screen.
     #[test]
